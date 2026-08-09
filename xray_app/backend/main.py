@@ -3,7 +3,7 @@ import uuid
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from model_utils import predict_and_explain, validate_image
+from model_utils import predict_and_explain, validate_image, generate_pdf_report
 
 app = FastAPI(title="Pneumonia X-Ray Risk Awareness Tool")
 
@@ -16,6 +16,8 @@ app.add_middleware(
 
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+results_cache = {}  # simple in-memory cache: file_id -> result dict
 
 
 @app.get("/")
@@ -46,6 +48,8 @@ async def predict(file: UploadFile = File(...)):
         return JSONResponse(status_code=500, content={"error": f"Analysis failed: {str(e)}"})
 
     result["overlay_url"] = f"/overlay/{file_id}"
+    result["file_id"] = file_id
+    results_cache[file_id] = result
     return result
 
 
@@ -53,3 +57,16 @@ async def predict(file: UploadFile = File(...)):
 def get_overlay(file_id: str):
     path = os.path.join(TEMP_DIR, f"{file_id}_overlay.png")
     return FileResponse(path, media_type="image/png")
+
+
+@app.get("/report/{file_id}")
+def get_report(file_id: str):
+    if file_id not in results_cache:
+        return JSONResponse(status_code=404, content={"error": "Report not found. Please analyze the image again."})
+
+    result = results_cache[file_id]
+    overlay_path = os.path.join(TEMP_DIR, f"{file_id}_overlay.png")
+    report_path = os.path.join(TEMP_DIR, f"{file_id}_report.pdf")
+
+    generate_pdf_report(result, overlay_path, report_path)
+    return FileResponse(report_path, media_type="application/pdf", filename="xray_screening_report.pdf")

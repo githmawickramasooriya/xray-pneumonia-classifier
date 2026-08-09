@@ -6,6 +6,10 @@ from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import image
 from PIL import Image as PILImage
 import matplotlib.pyplot as plt
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas
+from datetime import datetime
 
 IMG_SIZE = (224, 224)
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "best_model_final.keras")
@@ -41,19 +45,14 @@ head_model = tf.keras.Model(head_input, x)
 print("Grad-CAM models built and ready.")
 
 
-# --- Input validation (runs before the model ever sees the image) ---
 def validate_image(img_path, min_size=50, blur_threshold=15.0):
-    """
-    Basic sanity checks on an uploaded image before running inference.
-    Returns (is_valid: bool, reason: str or None)
-    """
     try:
         img = PILImage.open(img_path)
         img.verify()
     except Exception:
         return False, "The uploaded file could not be read as a valid image."
 
-    img = PILImage.open(img_path)  # reopen — verify() closes the file handle
+    img = PILImage.open(img_path)
 
     width, height = img.size
     if width < min_size or height < min_size:
@@ -119,25 +118,28 @@ def get_risk_level(probability, low_threshold=0.30, high_threshold=0.70):
         return "High"
 
 
+def get_confidence_level(probability):
+    distance_from_uncertain = abs(probability - 0.5)
+
+    if distance_from_uncertain >= 0.35:
+        return "High", "The model is confident in this assessment."
+    elif distance_from_uncertain >= 0.15:
+        return "Moderate", "The model has moderate confidence. Consider this alongside other information."
+    else:
+        return "Low", "This case falls in an uncertain range — treat this result with extra caution."
+
+
 def get_heatmap_region(heatmap):
-    """
-    Coarse quadrant-based approximation of where the heatmap is most active.
-    Not a precise anatomical localization — see MODEL_CARD.md for this limitation.
-    """
     h, w = heatmap.shape
     y, x = np.unravel_index(np.argmax(heatmap), heatmap.shape)
 
-    vertical = "upper" if y < h / 2 else "lower"
-    horizontal = "right" if x < w / 2 else "left"  # X-ray convention: image-left = patient's right
+    vertical_zone = "upper zone" if y < h / 2 else "lower zone"
+    side = "right" if x < w / 2 else "left"
 
-    return f"{vertical} {horizontal} lung field"
+    return f"{side} {vertical_zone}"
 
 
 def generate_explanation(risk_level, probability, region):
-    """
-    Plain-language summary of the MODEL'S OUTPUT — describes what the model
-    flagged, framed as awareness/screening language, never as a diagnosis.
-    """
     disclaimer_tail = (
         " This is an AI screening aid, not a diagnosis. "
         "Please consult a qualified healthcare professional for clinical evaluation."
@@ -161,6 +163,73 @@ def generate_explanation(risk_level, probability, region):
         )
 
 
+def _wrap_text(text, max_chars):
+    words = text.split()
+    lines, current = [], ""
+    for word in words:
+        if len(current) + len(word) + 1 <= max_chars:
+            current += (" " if current else "") + word
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def generate_pdf_report(result, overlay_path, report_path):
+    c = canvas.Canvas(report_path, pagesize=letter)
+    width, height = letter
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(1 * inch, height - 1 * inch, "Chest X-Ray Screening Report")
+
+    c.setFont("Helvetica", 10)
+    c.drawString(1 * inch, height - 1.3 * inch, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(1 * inch, height - 1.8 * inch, f"Risk Level: {result['risk_level']}")
+    c.setFont("Helvetica", 11)
+    c.drawString(1 * inch, height - 2.1 * inch, f"Probability (pneumonia-associated patterns): {result['probability']:.1%}")
+    c.drawString(1 * inch, height - 2.4 * inch, f"Model Confidence: {result['confidence_level']}")
+
+    # Explanation text block — give it enough vertical room before the image starts
+    c.setFont("Helvetica", 10)
+    text_obj = c.beginText(1 * inch, height - 2.9 * inch)
+    text_obj.setFont("Helvetica", 10)
+    wrapped_lines = _wrap_text(result["explanation"], 90)
+    for line in wrapped_lines:
+        text_obj.textLine(line)
+    c.drawText(text_obj)
+
+    # Calculate where the text block ended, add spacing, THEN place the image below it
+    line_height = 12  # approx points per line at font size 10
+    text_block_height = len(wrapped_lines) * line_height
+    image_top = height - 2.9 * inch - text_block_height - 0.4 * inch  # extra gap after text
+
+    try:
+        image_size = 3.2 * inch
+        c.drawImage(
+            overlay_path,
+            1 * inch,
+            image_top - image_size,
+            width=image_size,
+            height=image_size
+        )
+    except Exception:
+        pass
+
+    c.setFont("Helvetica-Oblique", 8)
+    disclaimer = (
+        "This is an AI screening aid, not a medical diagnosis. "
+        "Please consult a qualified healthcare professional for clinical evaluation."
+    )
+    c.drawString(1 * inch, 1 * inch, disclaimer)
+
+    c.save()
+    return report_path
+
+
 def predict_and_explain(img_path, output_path):
     img_array = preprocess_single_image(img_path)
     heatmap, pred_prob = make_gradcam_heatmap(img_array)
@@ -171,10 +240,13 @@ def predict_and_explain(img_path, output_path):
     risk_level = get_risk_level(pred_prob)
     region = get_heatmap_region(heatmap)
     explanation = generate_explanation(risk_level, pred_prob, region)
+    confidence_level, confidence_note = get_confidence_level(pred_prob)
 
     return {
         "probability": float(pred_prob),
         "risk_level": risk_level,
         "explanation": explanation,
+        "confidence_level": confidence_level,
+        "confidence_note": confidence_note,
         "overlay_path": output_path
     }
